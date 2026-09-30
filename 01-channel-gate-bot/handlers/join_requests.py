@@ -1,186 +1,217 @@
+"""
+Ядро бота: заявка на вступление не одобряется автоматически — сначала
+пользователь должен подтвердить осознанный интерес.
+
+Важно (это не очевидно и ломает рассылку, если не учесть): Telegram даёт
+боту право писать пользователю в будущем, только если пользователь САМ
+отправил боту настоящее сообщение (например, /start) — обычный клик по
+инлайн-кнопке (callback) для этого НЕ считается. Поэтому подтверждение
+сделано через кнопку-ссылку вида t.me/<bot>?start=confirm_<user_id>:
+при нажатии Telegram открывает чат с ботом и автоматически отправляет
+"/start confirm_<user_id>" как настоящее сообщение от пользователя —
+для человека это один и тот же тап, но право писать ему закрепляется
+надёжно.
+
+Если пользователь не подтверждает вовремя, заявка не отклоняется сразу —
+отправляется до MAX_REMINDER_ATTEMPTS напоминаний, и только потом отказ.
+"""
 import asyncio
 import logging
-from typing import Dict, Tuple
+import re
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import CallbackQuery, ChatJoinRequest, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.types import ChatJoinRequest, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from config import BONUS_LINK, CONFIRM_TIMEOUT_SECONDS
-from database.db import add_user
+from config import BONUS_LINK, CONFIRM_TIMEOUT_SECONDS, MAX_REMINDER_ATTEMPTS
+from database.db import bump_reminder, create_pending_request, get_pending_request, mark_declined, mark_verified
 
-router = Router()
 logger = logging.getLogger(__name__)
+router = Router(name="join_requests")
 
-# Хранилище запущенных таймеров. Ключ: (chat_id, user_id) -> asyncio.Task
-pending_tasks: Dict[Tuple[int, int], asyncio.Task] = {}
+# Заполняется один раз при старте бота (см. bot.py) через set_bot_username().
+_bot_username: str | None = None
 
 
-def get_confirm_keyboard(chat_id: int) -> InlineKeyboardMarkup:
-    """Создает клавиатуру с кнопкой подтверждения."""
+def set_bot_username(username: str) -> None:
+    """Вызывается один раз при старте бота — нужно для сборки диплинк-кнопки."""
+    global _bot_username
+    _bot_username = username
+
+
+def _build_confirm_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    if not _bot_username:
+        raise RuntimeError(
+            "Имя бота не установлено. Убедись, что bot.py вызывает "
+            "join_requests.set_bot_username() перед стартом polling."
+        )
+    deep_link = f"https://t.me/{_bot_username}?start=confirm_{user_id}"
     return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="✅ Подтверждаю и забираю бонус",
-                    callback_data=f"confirm_join:{chat_id}",
-                )
-            ]
-        ]
+        inline_keyboard=[[InlineKeyboardButton(text="✅ Подтверждаю и забираю бонус", url=deep_link)]]
     )
 
 
-async def request_timeout_lifecycle(
-    chat_id: int,
-    user_id: int,
-    message_id: int,
-    bot: Bot,
-) -> None:
-    """
-    Жизненный цикл ожидания подтверждения с 2 напоминаниями и итоговым отклонением.
-    """
-    key = (chat_id, user_id)
-    try:
-        # === Этап 1: Ждем первого таймаута ===
-        await asyncio.sleep(CONFIRM_TIMEOUT_SECONDS)
+def _build_welcome_text(first_name: str) -> str:
+    return (
+        f"👋 Здравствуйте, {first_name}!\n\n"
+        "Доступ в канал и бонус для новых участников уже готовы для вас.\n"
+        "Осталось одно — подтвердить, что вы здесь осознанно."
+    )
 
-        # Первое напоминание (мягкое)
-        reminder_1 = (
-            "⏳ **Доступ и бонус всё ещё ждут вас!**\n\n"
-            "Вы подали заявку на вступление в канал. "
-            "Подтвердите, что вы не бот, чтобы мы могли одобрить доступ."
+
+def _build_reminder_text(is_last: bool) -> str:
+    if is_last:
+        return (
+            "⏳ Это последнее напоминание.\n\n"
+            "Доступ в канал и бонус всё ещё вас ждут, но если не подтвердить сейчас, "
+            "заявку придётся отклонить."
         )
-        await bot.edit_message_text(
-            chat_id=user_id,
-            message_id=message_id,
-            text=reminder_1,
-            reply_markup=get_confirm_keyboard(chat_id),
-            parse_mode="Markdown",
-        )
-        logger.info(f"Отправлено 1-е напоминание пользователю {user_id}")
-
-        # === Этап 2: Ждем второго таймаута ===
-        await asyncio.sleep(CONFIRM_TIMEOUT_SECONDS)
-
-        # Второе напоминание (строгое / последнее)
-        reminder_2 = (
-            "⚠️ **Это последний шанс!**\n\n"
-            "Ваша заявка будет автоматически отклонена через несколько минут. "
-            "Нажмите кнопку ниже, чтобы войти в канал и забрать бонус:"
-        )
-        await bot.edit_message_text(
-            chat_id=user_id,
-            message_id=message_id,
-            text=reminder_2,
-            reply_markup=get_confirm_keyboard(chat_id),
-            parse_mode="Markdown",
-        )
-        logger.info(f"Отправлено 2-е напоминание пользователю {user_id}")
-
-        # === Этап 3: Ждем финального таймаута ===
-        await asyncio.sleep(CONFIRM_TIMEOUT_SECONDS)
-
-        # Если не нажал — отклоняем заявку в канал
-        await bot.decline_chat_join_request(chat_id=chat_id, user_id=user_id)
-
-        await bot.edit_message_text(
-            chat_id=user_id,
-            message_id=message_id,
-            text="❌ **Время ожидания истекло.**\n\nВаша заявка на вступление была отклонена. Если захотите вступить снова — подайте заявку заново.",
-            parse_mode="Markdown",
-        )
-        logger.info(f"Заявка пользователя {user_id} в канал {chat_id} отклонена по таймауту.")
-
-    except asyncio.CancelledError:
-        # Задача была отменена, так как пользователь вовремя нажал кнопку
-        logger.info(f"Таймаут для пользователя {user_id} отменен (подтвердил вход).")
-    except TelegramBadRequest as e:
-        logger.warning(f"Ошибка при обновлении сообщения для {user_id}: {e}")
-    finally:
-        # В любом случае удаляем задачу из реестра
-        pending_tasks.pop(key, None)
+    return (
+        "⏳ Не забудьте забрать свой доступ и бонус — "
+        "осталось только подтвердить, что вы здесь осознанно."
+    )
 
 
 @router.chat_join_request()
-async def handle_join_request(event: ChatJoinRequest, bot: Bot) -> None:
-    """Перехват заявки на вступление и запуск таймеров."""
-    user_id = event.from_user.id
-    chat_id = event.chat.id
-    key = (chat_id, user_id)
+async def handle_chat_join_request(event: ChatJoinRequest, bot: Bot) -> None:
+    user = event.from_user
 
-    # Если для этого юзера уже есть запущенный таймер (например, подал заявку повторно) — отменяем старый
-    if key in pending_tasks:
-        pending_tasks[key].cancel()
+    invite_link_name = "Прямой запуск"
+    if event.invite_link:
+        invite_link_name = event.invite_link.name or event.invite_link.invite_link
 
-    start_text = (
-        f"👋 Здравствуйте, {event.from_user.full_name}!\n\n"
-        f"Доступ в канал и бонус для новых участников уже готовы для вас.\n\n"
-        f"Осталось одно — подтвердить, что вы здесь осознанно."
+    try:
+        sent = await bot.send_message(
+            chat_id=user.id,
+            text=_build_welcome_text(user.first_name),
+            reply_markup=_build_confirm_keyboard(user.id),
+        )
+    except TelegramForbiddenError:
+        # Пользователь заблокировал бота ещё до нашего сообщения — без диалога
+        # с ним заявку подтвердить невозможно, поэтому отклоняем сразу.
+        logger.warning("Не удалось написать пользователю %s: бот заблокирован", user.id)
+        try:
+            await event.decline()
+        except Exception:
+            logger.exception("Не удалось отклонить заявку пользователя %s", user.id)
+        return
+    except Exception:
+        logger.exception("Не удалось отправить сообщение с подтверждением пользователю %s", user.id)
+        return
+
+    await create_pending_request(
+        user_id=user.id,
+        username=user.username or "Не указан",
+        full_name=user.full_name,
+        invite_link=invite_link_name,
+        chat_id=event.chat.id,
+        confirm_message_id=sent.message_id,
     )
 
-    try:
-        sent_message = await bot.send_message(
-            chat_id=user_id,
-            text=start_text,
-            reply_markup=get_confirm_keyboard(chat_id),
-        )
+    asyncio.create_task(_handle_timeout(bot, user.id, event.chat.id, sent.message_id))
 
-        # Запускаем фоновую задачу с цепочкой напоминаний
-        task = asyncio.create_task(
-            request_timeout_lifecycle(
-                chat_id=chat_id,
-                user_id=user_id,
-                message_id=sent_message.message_id,
-                bot=bot,
+
+async def _handle_timeout(bot: Bot, user_id: int, chat_id: int, message_id: int) -> None:
+    """
+    Срабатывает через CONFIRM_TIMEOUT_SECONDS после отправки сообщения.
+    Если пользователь ещё не подтвердил — не отклоняем сразу, а шлём
+    напоминание (новым сообщением, чтобы пришло уведомление), и только
+    после MAX_REMINDER_ATTEMPTS напоминаний без ответа отклоняем заявку.
+    """
+    await asyncio.sleep(CONFIRM_TIMEOUT_SECONDS)
+
+    pending = await get_pending_request(user_id)
+    if pending is None or pending["status"] != "pending":
+        return  # пользователь уже подтвердил, либо заявка уже отклонена
+
+    attempt = pending["reminder_count"] + 1
+
+    if attempt <= MAX_REMINDER_ATTEMPTS:
+        is_last = attempt == MAX_REMINDER_ATTEMPTS
+        try:
+            sent = await bot.send_message(
+                chat_id=user_id,
+                text=_build_reminder_text(is_last),
+                reply_markup=_build_confirm_keyboard(user_id),
             )
-        )
-        pending_tasks[key] = task
+        except TelegramForbiddenError:
+            try:
+                await bot.decline_chat_join_request(chat_id=chat_id, user_id=user_id)
+            except Exception:
+                logger.exception("Не удалось отклонить заявку пользователя %s", user_id)
+            await mark_declined(user_id, reason="blocked")
+            return
+        except Exception:
+            logger.exception("Не удалось отправить напоминание пользователю %s", user_id)
+            return
 
+        await bump_reminder(user_id, sent.message_id)
+        asyncio.create_task(_handle_timeout(bot, user_id, chat_id, sent.message_id))
+        return
+
+    # Напоминания закончились, подтверждения так и не было — отклоняем.
+    try:
+        await bot.decline_chat_join_request(chat_id=chat_id, user_id=user_id)
     except TelegramBadRequest as e:
-        logger.error(f"Не удалось отправить приветствие пользователю {user_id} (возможно, не запускал бота): {e}")
+        logger.warning("Заявка пользователя %s уже недоступна для отклонения: %s", user_id, e)
+    except Exception:
+        logger.exception("Не удалось отклонить просроченную заявку пользователя %s", user_id)
 
-
-@router.callback_query(F.data.startswith("confirm_join:"))
-async def process_confirm_join(callback: CallbackQuery, bot: Bot) -> None:
-    """Обработка клика по кнопке подтверждения."""
-    chat_id = int(callback.data.split(":")[1])
-    user = callback.from_user
-    key = (chat_id, user.id)
-
-    # 1. Отменяем фоновый таймер с напоминаниями
-    if key in pending_tasks:
-        pending_tasks[key].cancel()
-        pending_tasks.pop(key, None)
+    await mark_declined(user_id, reason="timeout")
 
     try:
-        # 2. Одобряем заявку в Telegram
-        await bot.approve_chat_join_request(chat_id=chat_id, user_id=user.id)
-
-        # 3. Сохраняем пользователя в БД
-        await add_user(
-            user_id=user.id,
-            username=user.username,
-            full_name=user.full_name,
+        await bot.edit_message_text(
+            chat_id=user_id,
+            message_id=message_id,
+            text="⌛ Время ожидания истекло, заявка отклонена. Подайте заявку заново, если это ошибка.",
+            reply_markup=None,
         )
+    except Exception:
+        logger.exception("Не удалось отредактировать сообщение для %s", user_id)
 
-        # 4. Клавиатура со ссылкой на бонус
-        bonus_keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="🎁 Забрать бонус", url=BONUS_LINK)]
-            ]
-        )
 
-        # 5. Меняем текст сообщения на финальное
-        await callback.message.edit_text(
-            text="✅ **Отлично, вы в канале!**\n\nЗабирайте ваш бонус по кнопке ниже:",
-            reply_markup=bonus_keyboard,
-            parse_mode="Markdown",
-        )
-        await callback.answer("Заявка успешно одобрена!")
+@router.message(F.text.regexp(r"^/start confirm_(\d+)$").as_("match"))
+async def process_confirm_deep_link(message: Message, match: re.Match[str], bot: Bot) -> None:
+    """
+    Ловит ТОЛЬКО "/start confirm_<id>" — деплинк из нашей кнопки. Обычный
+    голый /start этим фильтром не перехватывается и уходит в admin.py/user.py.
+    """
+    expected_user_id = int(match.group(1))
+    user_id = message.from_user.id
 
+    if user_id != expected_user_id:
+        # Ссылка предназначалась другому пользователю — молча игнорируем.
+        return
+
+    pending = await get_pending_request(user_id)
+    if pending is None or pending["status"] != "pending":
+        await message.answer("Эта заявка уже обработана.")
+        return
+
+    try:
+        await bot.approve_chat_join_request(chat_id=pending["chat_id"], user_id=user_id)
     except TelegramBadRequest as e:
-        logger.error(f"Ошибка при одобрении заявки {user.id}: {e}")
-        await callback.answer(
-            "Не удалось одобрить заявку. Возможно, она уже недействительна.",
-            show_alert=True,
-        )
+        logger.warning("Заявка пользователя %s не найдена или уже обработана: %s", user_id, e)
+        await message.answer("Не удалось одобрить заявку — возможно, она уже обработана.")
+        return
+    except Exception:
+        logger.exception("Ошибка при одобрении заявки пользователя %s", user_id)
+        await message.answer("Произошла ошибка, попробуйте позже.")
+        return
+
+    await mark_verified(user_id)
+
+    welcome_text = (
+        "✅ Отлично, вы в канале!\n\n"
+        f"🎁 Забирайте ваш бонус: <a href=\"{BONUS_LINK}\">по этой ссылке</a>"
+    )
+    await message.answer(welcome_text, parse_mode="HTML", disable_web_page_preview=True)
+
+    # Косметика: убираем кнопку с предыдущего сообщения, чтобы не висела бесполезная ссылка.
+    if pending["confirm_message_id"]:
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=user_id, message_id=pending["confirm_message_id"], reply_markup=None
+            )
+        except Exception:
+            pass  # не критично — чисто косметическая правка

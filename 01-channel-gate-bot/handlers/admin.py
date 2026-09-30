@@ -28,12 +28,14 @@ async def cmd_admin_start(message: Message) -> None:
 
 @router.callback_query(F.data == "admin_stats", F.from_user.id.in_(ADMIN_IDS))
 async def process_stats(callback: CallbackQuery) -> None:
-    total, active = await get_stats()
+    total, verified, pending, declined, blocked = await get_stats()
     text = (
         "📈 <b>Статистика бота:</b>\n\n"
-        f"👤 Всего пользователей в БД: <b>{total}</b>\n"
-        f"✅ Активных (получают сообщения): <b>{active}</b>\n"
-        f"❌ Заблокировали бота: <b>{total - active}</b>"
+        f"👤 Всего заявок: <b>{total}</b>\n"
+        f"✅ Подтвердили интерес и подписаны: <b>{verified}</b>\n"
+        f"⏳ Ждут ответа: <b>{pending}</b>\n"
+        f"🚫 Отклонены по таймауту: <b>{declined}</b>\n"
+        f"❌ Заблокировали бота: <b>{blocked}</b>"
     )
     try:
         await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_admin_keyboard())

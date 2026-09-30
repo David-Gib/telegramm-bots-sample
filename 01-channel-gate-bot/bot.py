@@ -27,10 +27,12 @@ async def main() -> None:
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
 
-    # Порядок важен: сначала admin (ловит только ID из ADMIN_IDS), затем user и join_requests
+    # Порядок оставлен по смыслу (admin -> join_requests -> user), но теперь
+    # не является критичным: у каждого хендлера достаточно узкий фильтр,
+    # чтобы не перехватывать чужие апдейты (см. комментарии в user.py).
     dp.include_router(admin.router)
-    dp.include_router(user.router)
     dp.include_router(join_requests.router)
+    dp.include_router(user.router)
 
     await init_db()
     logger.info("База данных инициализирована.")
@@ -38,8 +40,12 @@ async def main() -> None:
     # Снимаем возможный старый webhook и висящие апдейты, иначе polling не запустится
     await bot.delete_webhook(drop_pending_updates=True)
 
+    me = await bot.get_me()
+    join_requests.set_bot_username(me.username)
+    logger.info("Бот запущен как @%s", me.username)
+
     try:
-        logger.info("Бот запущен, начинаю polling...")
+        logger.info("Начинаю polling...")
         await dp.start_polling(bot)
     finally:
         await bot.session.close()

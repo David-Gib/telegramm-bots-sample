@@ -32,11 +32,11 @@ def _parse_admin_ids(raw: str) -> list[int]:
     if not ids:
         raise RuntimeError("ADMIN_IDS задан, но не содержит ни одного ID.")
     return ids
-# Время ожидания перед каждым напоминанием (в секундах)
-# 300 сек = 5 минут. Для тестов можно поставить 10-15 секунд.
-CONFIRM_TIMEOUT_SECONDS: int = int(os.getenv("CONFIRM_TIMEOUT_SECONDS", "300"))
+
 
 BOT_TOKEN: str = _require("BOT_TOKEN")
 ADMIN_IDS: list[int] = _parse_admin_ids(_require("ADMIN_IDS"))
 DB_PATH: str = os.getenv("DB_PATH", "bot_database.db")
 BONUS_LINK: str = os.getenv("BONUS_LINK", "https://example.com/bonus")
+CONFIRM_TIMEOUT_SECONDS: int = int(os.getenv("CONFIRM_TIMEOUT_SECONDS", "300"))
+MAX_REMINDER_ATTEMPTS: int = int(os.getenv("MAX_REMINDER_ATTEMPTS", "2"))
